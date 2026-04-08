@@ -1,12 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Blink - Block websites and all their subdomains
-# Uses dnsmasq for wildcard DNS blocking
+# Blink - Block websites and their subdomains
+# Discovers subdomains and writes them to /etc/hosts
 
-BLOCKLIST_FILE="/etc/dnsmasq.d/blink-blocklist.conf"
-HARDLOCK_FILE="/etc/blink/hardlock"
-CONFIG_FILE="/etc/blink/config"
+EFFECTIVE_HOME="$HOME"
+if [[ -n "${SUDO_USER:-}" ]]; then
+    EFFECTIVE_HOME=$(eval echo "~${SUDO_USER}")
+fi
+
+if [[ -n "${BLINK_STATE_DIR:-}" ]]; then
+    STATE_DIR="$BLINK_STATE_DIR"
+elif [[ -n "${SUDO_USER:-}" ]]; then
+    STATE_DIR="$EFFECTIVE_HOME/.local/state/blink"
+else
+    STATE_DIR="${XDG_STATE_HOME:-$EFFECTIVE_HOME/.local/state}/blink"
+fi
+
+BLOCKED_DOMAINS_FILE="$STATE_DIR/domains"
+HARDLOCK_FILE="$STATE_DIR/hardlock"
+CONFIG_FILE="$STATE_DIR/config"
+HOSTS_FILE="/etc/hosts"
+SUBDOMAIN_TOOL="${BLINK_SUBDOMAIN_TOOL:-sublist3r}"
+HOSTS_MARKER="# blink:"
 MATH_PROBLEMS=10
 
 # Colors
@@ -15,72 +31,80 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+run_with_sudo() {
+    if [[ $EUID -eq 0 ]]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+ensure_sudo_available() {
+    if [[ $EUID -ne 0 ]] && ! command -v sudo >/dev/null 2>&1; then
+        echo -e "${RED}Error: sudo is required to modify /etc/hosts${NC}"
+        exit 1
+    fi
+}
+
 show_status() {
     echo -e "${YELLOW}blink${NC} - block websites from terminal"
     echo ""
     echo "Usage:"
-    echo "  sudo blink youtube.com      # Toggle block (hard lock)"
-    echo "  sudo blink -s youtube.com   # Toggle block (soft lock)"
-    echo "  sudo blink --setup          # Configure math difficulty"
+    echo "  blink youtube.com      # Toggle block (prompts for sudo)"
+    echo "  blink -s youtube.com   # Toggle block (soft lock)"
+    echo "  blink --setup          # Configure math difficulty"
     echo ""
 
-    ensure_blocklist_file
-    ensure_hardlock_file
+    if [[ ! -r "$BLOCKED_DOMAINS_FILE" ]]; then
+        echo "State file not found. Run the installer or block a domain first."
+        return
+    fi
 
-    local blocked
-    blocked=$(grep "^address=/" "$BLOCKLIST_FILE" 2>/dev/null | sed 's/address=\/\(.*\)\/$/\1/' || true)
-
-    if [[ -z "$blocked" ]]; then
+    if [[ ! -s "$BLOCKED_DOMAINS_FILE" ]]; then
         echo "No domains currently blocked"
-    else
-        echo "Blocked:"
-        echo "$blocked" | while read -r domain; do
-            local lock_info=""
-            if is_hardlocked "$domain"; then
-                lock_info=" ${RED}[HARD]${NC}"
-            fi
-            echo -e "  - $domain$lock_info"
-        done
+        return
     fi
+
+    echo "Blocked:"
+    while read -r domain; do
+        [[ -z "$domain" ]] && continue
+        local lock_info=""
+        if is_hardlocked "$domain"; then
+            lock_info=" ${RED}[HARD]${NC}"
+        fi
+        echo -e "  - $domain$lock_info"
+    done < "$BLOCKED_DOMAINS_FILE"
 }
 
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        echo -e "${RED}Error: blink requires root privileges${NC}"
-        echo "Run with: sudo blink $*"
+ensure_state_files() {
+    mkdir -p "$STATE_DIR"
+    touch "$BLOCKED_DOMAINS_FILE"
+    ensure_hardlock_file
+    ensure_config_file
+}
+
+require_subdomain_tool() {
+    if ! command -v "$SUBDOMAIN_TOOL" >/dev/null 2>&1; then
+        echo -e "${RED}Error: Required tool '$SUBDOMAIN_TOOL' not found${NC}"
+        echo "Install Sublist3r (https://github.com/aboul3la/Sublist3r) or set BLINK_SUBDOMAIN_TOOL"
         exit 1
     fi
 }
 
-check_dnsmasq() {
-    if ! command -v dnsmasq &> /dev/null; then
-        echo -e "${RED}Error: dnsmasq is not installed${NC}"
-        echo "Run the install script first"
-        exit 1
-    fi
+add_blocked_domain() {
+    local domain="$1"
+    grep -qx "$domain" "$BLOCKED_DOMAINS_FILE" 2>/dev/null || echo "$domain" >> "$BLOCKED_DOMAINS_FILE"
 }
 
-ensure_blocklist_file() {
-    if [[ ! -f "$BLOCKLIST_FILE" ]]; then
-        mkdir -p "$(dirname "$BLOCKLIST_FILE")" 2>/dev/null || true
-        touch "$BLOCKLIST_FILE" 2>/dev/null || true
-        echo "# Blink blocklist - managed by blink CLI" > "$BLOCKLIST_FILE" 2>/dev/null || true
-    fi
-}
-
-restart_dnsmasq() {
-    if [[ "$(uname)" == "Darwin" ]]; then
-        killall -HUP dnsmasq 2>/dev/null || true
-        dscacheutil -flushcache 2>/dev/null || true
-        killall -HUP mDNSResponder 2>/dev/null || true
-    else
-        systemctl restart dnsmasq 2>/dev/null || service dnsmasq restart 2>/dev/null || true
-    fi
+remove_blocked_domain() {
+    local domain="$1"
+    sed -i.bak "/^${domain}$/d" "$BLOCKED_DOMAINS_FILE" 2>/dev/null || true
+    rm -f "${BLOCKED_DOMAINS_FILE}.bak"
 }
 
 is_blocked() {
     local domain="$1"
-    grep -q "^address=/${domain}/$" "$BLOCKLIST_FILE" 2>/dev/null
+    grep -qx "$domain" "$BLOCKED_DOMAINS_FILE" 2>/dev/null
 }
 
 is_hardlocked() {
@@ -99,6 +123,97 @@ ensure_config_file() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         mkdir -p "$(dirname "$CONFIG_FILE")"
         echo "MATH_DIFFICULTY=2x2" > "$CONFIG_FILE"
+    fi
+}
+
+discover_subdomains() {
+    local domain="$1"
+    local -a seeds=("www" "m" "mobile" "touch" "app" "apps" "secure" "login" "auth" "api" "cdn" "static")
+
+    {
+        echo "$domain"
+        for seed in "${seeds[@]}"; do
+            echo "${seed}.${domain}"
+        done
+        "$SUBDOMAIN_TOOL" -silent -d "$domain" 2>/dev/null || true
+    } | sed 's/\r$//' | awk 'NF' | tr 'A-Z' 'a-z' | sort -u
+}
+
+write_hosts_block() {
+    local domain="$1"
+    shift
+    local -a entries=("$@")
+    local start_marker="# blink:start:${domain}"
+    local end_marker="# blink:end:${domain}"
+
+    remove_hosts_block "$domain"
+
+    if [[ ${#entries[@]} -eq 0 ]]; then
+        entries=("$domain")
+    fi
+
+    local tmp
+    tmp=$(mktemp)
+    {
+        echo "$start_marker"
+        for host in "${entries[@]}"; do
+            [[ -z "$host" ]] && continue
+            echo "127.0.0.1 $host ${HOSTS_MARKER}${domain}"
+            echo "::1 $host ${HOSTS_MARKER}${domain}"
+        done
+        echo "$end_marker"
+    } > "$tmp"
+
+    ensure_sudo_available
+    run_with_sudo tee -a "$HOSTS_FILE" < "$tmp" >/dev/null
+    rm -f "$tmp"
+}
+
+remove_hosts_block() {
+    local domain="$1"
+    local start_marker="# blink:start:${domain}"
+    local end_marker="# blink:end:${domain}"
+    local tmp
+
+    [[ -f "$HOSTS_FILE" ]] || return 0
+
+    if ! grep -q "$start_marker" "$HOSTS_FILE" 2>/dev/null; then
+        return 0
+    fi
+
+    tmp=$(mktemp)
+    local skipping=0
+    while IFS= read -r line; do
+        if [[ "$line" == "$start_marker" ]]; then
+            skipping=1
+            continue
+        fi
+        if [[ "$line" == "$end_marker" ]]; then
+            skipping=0
+            continue
+        fi
+        if [[ $skipping -eq 0 ]]; then
+            echo "$line"
+        fi
+    done < "$HOSTS_FILE" > "$tmp"
+
+    ensure_sudo_available
+    run_with_sudo install -m 644 "$tmp" "$HOSTS_FILE"
+    rm -f "$tmp"
+}
+
+flush_dns_cache() {
+    ensure_sudo_available
+
+    if [[ "$(uname)" == "Darwin" ]]; then
+        run_with_sudo dscacheutil -flushcache 2>/dev/null || true
+        run_with_sudo killall -HUP mDNSResponder 2>/dev/null || true
+    elif command -v systemd-resolve >/dev/null 2>&1; then
+        run_with_sudo systemd-resolve --flush-caches 2>/dev/null || true
+    elif command -v resolvectl >/dev/null 2>&1; then
+        run_with_sudo resolvectl flush-caches 2>/dev/null || true
+    elif command -v nscd >/dev/null 2>&1; then
+        run_with_sudo nscd -i hosts 2>/dev/null || true
     fi
 }
 
@@ -223,28 +338,40 @@ block_domain() {
     local domain="$1"
     local soft="${2:-false}"
 
-    ensure_blocklist_file
-    ensure_hardlock_file
+    ensure_state_files
+    require_subdomain_tool
+    ensure_sudo_available
 
-    echo "address=/${domain}/" >> "$BLOCKLIST_FILE"
+    local -a subdomains=()
+    while IFS= read -r line; do
+        subdomains+=("$line")
+    done < <(discover_subdomains "$domain")
+
+    write_hosts_block "$domain" "${subdomains[@]}"
+    add_blocked_domain "$domain"
 
     if [[ "$soft" != "true" ]]; then
-        echo "$domain" >> "$HARDLOCK_FILE"
+        grep -qx "$domain" "$HARDLOCK_FILE" 2>/dev/null || echo "$domain" >> "$HARDLOCK_FILE"
     fi
 
-    restart_dnsmasq
+    flush_dns_cache
 
+    local total=${#subdomains[@]}
     if [[ "$soft" == "true" ]]; then
-        echo -e "${GREEN}Blocked${NC} $domain (soft lock)"
+        echo -e "${GREEN}Blocked${NC} $domain (soft lock, ${total} hostnames)"
     else
         local difficulty
         difficulty=$(get_difficulty)
-        echo -e "${RED}Blocked${NC} $domain (hard lock - $MATH_PROBLEMS math problems to unblock)"
+        echo -e "${RED}Blocked${NC} $domain (hard lock - $MATH_PROBLEMS math problems to unblock, ${total} hostnames)"
+        echo -e "  Difficulty: ${YELLOW}$difficulty${NC}"
     fi
 }
 
 unblock_domain() {
     local domain="$1"
+
+    ensure_state_files
+    ensure_sudo_available
 
     # Check if hard locked - require math challenge
     if is_hardlocked "$domain"; then
@@ -253,9 +380,9 @@ unblock_domain() {
         rm -f "${HARDLOCK_FILE}.bak"
     fi
 
-    sed -i.bak "/^address=\/${domain}\/$/d" "$BLOCKLIST_FILE"
-    rm -f "${BLOCKLIST_FILE}.bak"
-    restart_dnsmasq
+    remove_hosts_block "$domain"
+    remove_blocked_domain "$domain"
+    flush_dns_cache
 
     echo -e "${GREEN}Unblocked${NC} $domain"
 }
@@ -264,7 +391,7 @@ toggle_domain() {
     local domain="$1"
     local soft="${2:-false}"
 
-    ensure_blocklist_file
+    ensure_state_files
 
     if is_blocked "$domain"; then
         unblock_domain "$domain"
@@ -276,31 +403,20 @@ toggle_domain() {
 uninstall_blink() {
     echo -e "${YELLOW}Uninstalling blink...${NC}"
 
-    # Remove config files
-    rm -rf /etc/blink
-    rm -f /etc/dnsmasq.d/blink-blocklist.conf
-    rm -f /etc/dnsmasq.d/blink-config.conf
-    rm -f /etc/dnsmasq.d/blink-hardlock.conf
+    ensure_state_files
+    ensure_sudo_available
 
-    # Stop dnsmasq
-    if [[ "$(uname)" == "Darwin" ]]; then
-        pkill dnsmasq 2>/dev/null || true
-
-        # Reset DNS
-        networksetup -listallnetworkservices | tail -n +2 | while read -r service; do
-            networksetup -setdnsservers "$service" empty 2>/dev/null || true
-        done
-        dscacheutil -flushcache 2>/dev/null || true
-        killall -HUP mDNSResponder 2>/dev/null || true
-    else
-        systemctl stop dnsmasq 2>/dev/null || true
-        rm -f /etc/systemd/resolved.conf.d/blink.conf 2>/dev/null || true
-        chattr -i /etc/resolv.conf 2>/dev/null || true
-        systemctl restart systemd-resolved 2>/dev/null || true
+    if [[ -f "$BLOCKED_DOMAINS_FILE" ]]; then
+        while read -r domain; do
+            [[ -z "$domain" ]] && continue
+            remove_hosts_block "$domain"
+        done < "$BLOCKED_DOMAINS_FILE"
     fi
 
-    # Remove blink CLI (self-destruct)
-    rm -f /usr/local/bin/blink
+    flush_dns_cache
+
+    rm -rf "$STATE_DIR"
+    run_with_sudo rm -f /usr/local/bin/blink
 
     echo -e "${GREEN}Blink uninstalled${NC}"
 }
@@ -318,12 +434,10 @@ main() {
             exit 0
             ;;
         --setup)
-            check_root "$@"
             setup_difficulty
             exit 0
             ;;
         uninstall)
-            check_root "$@"
             uninstall_blink
             exit 0
             ;;
@@ -332,8 +446,6 @@ main() {
                 echo -e "${RED}Error: domain required${NC}"
                 exit 1
             fi
-            check_root "$@"
-            check_dnsmasq
             toggle_domain "$2" "true"
             ;;
         -*)
@@ -342,8 +454,6 @@ main() {
             exit 1
             ;;
         *)
-            check_root "$@"
-            check_dnsmasq
             toggle_domain "$1"
             ;;
     esac
